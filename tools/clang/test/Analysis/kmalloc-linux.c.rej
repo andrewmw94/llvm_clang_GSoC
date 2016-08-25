@@ -1,0 +1,9 @@
+--- test/Analysis/kmalloc-linux.c
++++ test/Analysis/kmalloc-linux.c
+@@ -55,5 +56,5 @@
+     t = list[i]; // expected-warning{{undefined}}
+     foo(t);
+   }
+-  free(list);
++  kfree(list);
+ 

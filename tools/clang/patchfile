@@ -1,0 +1,151 @@
+Index: lib/StaticAnalyzer/Checkers/MallocChecker.cpp
+===================================================================
+--- lib/StaticAnalyzer/Checkers/MallocChecker.cpp
++++ lib/StaticAnalyzer/Checkers/MallocChecker.cpp
+@@ -44,6 +44,7 @@
+   AF_CXXNew,
+   AF_CXXNewArray,
+   AF_IfNameIndex,
++  AF_KMalloc,
+   AF_Alloca
+ };
+ 
+@@ -173,8 +174,9 @@
+         II_free(nullptr), II_realloc(nullptr), II_calloc(nullptr),
+         II_valloc(nullptr), II_reallocf(nullptr), II_strndup(nullptr),
+         II_strdup(nullptr), II_win_strdup(nullptr), II_kmalloc(nullptr),
+-        II_if_nameindex(nullptr), II_if_freenameindex(nullptr),
+-        II_wcsdup(nullptr), II_win_wcsdup(nullptr) {}
++        II_kfree(nullptr), II_if_nameindex(nullptr),
++        II_if_freenameindex(nullptr), II_wcsdup(nullptr),
++        II_win_wcsdup(nullptr) {}
+ 
+   /// In pessimistic mode, the checker assumes that it does not know which
+   /// functions might free the memory.
+@@ -235,8 +237,8 @@
+   mutable IdentifierInfo *II_alloca, *II_win_alloca, *II_malloc, *II_free,
+                          *II_realloc, *II_calloc, *II_valloc, *II_reallocf,
+                          *II_strndup, *II_strdup, *II_win_strdup, *II_kmalloc,
+-                         *II_if_nameindex, *II_if_freenameindex, *II_wcsdup,
+-                         *II_win_wcsdup;
++                         *II_kfree, *II_if_nameindex, *II_if_freenameindex,
++                         *II_wcsdup, *II_win_wcsdup;
+   mutable Optional<uint64_t> KernelZeroFlagVal;
+ 
+   void initIdentifierInfo(ASTContext &C) const;
+@@ -287,7 +289,7 @@
+                                       ProgramStateRef State,
+                                       AllocationFamily Family = AF_Malloc);
+ 
+-  // Check if this malloc() for special flags. At present that means M_ZERO or
++  // Check this malloc() for special flags. At present that means M_ZERO or
+   // __GFP_ZERO (in which case, treat it like calloc).
+   llvm::Optional<ProgramStateRef>
+   performKernelMalloc(const CallExpr *CE, CheckerContext &C,
+@@ -544,6 +546,7 @@
+   II_strndup = &Ctx.Idents.get("strndup");
+   II_wcsdup = &Ctx.Idents.get("wcsdup");
+   II_kmalloc = &Ctx.Idents.get("kmalloc");
++  II_kfree = &Ctx.Idents.get("kfree");
+   II_if_nameindex = &Ctx.Idents.get("if_nameindex");
+   II_if_freenameindex = &Ctx.Idents.get("if_freenameindex");
+ 
+@@ -586,7 +589,8 @@
+     initIdentifierInfo(C);
+ 
+     if (Family == AF_Malloc && CheckFree) {
+-      if (FunI == II_free || FunI == II_realloc || FunI == II_reallocf)
++      if (FunI == II_free || FunI == II_realloc ||
++	  FunI == II_reallocf || FunI == II_kfree)
+         return true;
+     }
+ 
+@@ -796,7 +800,7 @@
+       State = CallocMem(C, CE, State);
+       State = ProcessZeroAllocation(C, CE, 0, State);
+       State = ProcessZeroAllocation(C, CE, 1, State);
+-    } else if (FunI == II_free) {
++    } else if (FunI == II_free || FunI == II_kfree) {
+       State = FreeMemAux(C, CE, State, 0, false, ReleasedAllocatedMemory);
+     } else if (FunI == II_strdup || FunI == II_win_strdup ||
+                FunI == II_wcsdup || FunI == II_win_wcsdup) {
+@@ -943,7 +947,7 @@
+   const CXXConstructorDecl *CtorD = ConstructE->getConstructor();
+ 
+   // Iterate over the constructor parameters.
+-  for (const auto *CtorParam : CtorD->parameters()) {
++  for (const auto *CtorParam : CtorD->params()) {
+ 
+     QualType CtorParamPointeeT = CtorParam->getType()->getPointeeType();
+     if (CtorParamPointeeT.isNull())
+@@ -1289,6 +1293,7 @@
+     case AF_CXXNew: os << "'new'"; return;
+     case AF_CXXNewArray: os << "'new[]'"; return;
+     case AF_IfNameIndex: os << "'if_nameindex()'"; return;
++    case AF_KMalloc: os <<"kmalloc()"; return;
+     case AF_Alloca:
+     case AF_None: llvm_unreachable("not a deallocation expression");
+   }
+@@ -1301,6 +1306,7 @@
+     case AF_CXXNew: os << "'delete'"; return;
+     case AF_CXXNewArray: os << "'delete[]'"; return;
+     case AF_IfNameIndex: os << "'if_freenameindex()'"; return;
++    case AF_KMalloc: os << "kfree()"; return;
+     case AF_Alloca:
+     case AF_None: llvm_unreachable("suspicious argument");
+   }
+@@ -1463,6 +1469,7 @@
+   switch (Family) {
+   case AF_Malloc:
+   case AF_Alloca:
++  case AF_KMalloc:
+   case AF_IfNameIndex: {
+     if (ChecksEnabled[CK_MallocChecker])
+       return CK_MallocChecker;
+@@ -2196,7 +2203,8 @@
+     if (ChecksEnabled[CK_MallocChecker] &&
+         (isCMemFunction(FD, Ctx, AF_Malloc, MemoryOperationKind::MOK_Free) ||
+          isCMemFunction(FD, Ctx, AF_IfNameIndex,
+-                        MemoryOperationKind::MOK_Free)))
++			MemoryOperationKind::MOK_Free) ||
++	 isCMemFunction(FD, Ctx, AF_KMalloc, MemoryOperationKind::MOK_Free)))
+       return;
+ 
+     if (ChecksEnabled[CK_NewDeleteChecker] &&
+Index: test/Analysis/kmalloc-linux.c
+===================================================================
+--- test/Analysis/kmalloc-linux.c
++++ test/Analysis/kmalloc-linux.c
+@@ -6,6 +6,7 @@
+ #define NULL ((void *)0)
+ 
+ void *kmalloc(size_t, int);
++void *kfree(size_t);
+ 
+ struct test {
+ };
+@@ -24,7 +25,7 @@
+     t = list[i];
+     foo(t);
+   }
+-  free(list); // no-warning
++  kfree(list); // no-warning
+ }
+ 
+ void test_nonzero() {
+@@ -39,7 +40,7 @@
+     t = list[i]; // expected-warning{{undefined}}
+     foo(t);
+   }
+-  free(list);
++  kfree(list);
+ }
+ 
+ void test_indeterminate(int flags) {
+@@ -54,5 +55,5 @@
+     t = list[i]; // expected-warning{{undefined}}
+     foo(t);
+   }
+-  free(list);
++  kfree(list);
+ }
